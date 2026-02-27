@@ -185,4 +185,105 @@ void main() {
       http.runWithClient(http.Client.new, http.Client.new);
     }, http.Client.new);
   });
+
+  group('307/308 method-preserving redirects', () {
+    test('POST + 307 preserves method and body', () async {
+      final client = http_io.IOClient();
+      final request = http.Request('POST', serverUrl.resolve('/redirect307'))
+        ..headers[HttpHeaders.contentTypeHeader] = 'application/json'
+        ..body = '{"hello":"world"}';
+
+      final response = await client.send(request);
+      final decoded = jsonDecode(await response.stream.bytesToString())
+          as Map<String, dynamic>;
+      client.close();
+
+      expect(decoded['method'], equals('POST'));
+      expect(decoded['path'], equals('/'));
+      expect(decoded['body'], equals('{"hello":"world"}'));
+    });
+
+    test('POST + 308 preserves method and body', () async {
+      final client = http_io.IOClient();
+      final request = http.Request('POST', serverUrl.resolve('/redirect308'))
+        ..headers[HttpHeaders.contentTypeHeader] = 'application/json'
+        ..body = '{"hello":"world"}';
+
+      final response = await client.send(request);
+      final decoded = jsonDecode(await response.stream.bytesToString())
+          as Map<String, dynamic>;
+      client.close();
+
+      expect(decoded['method'], equals('POST'));
+      expect(decoded['path'], equals('/'));
+      expect(decoded['body'], equals('{"hello":"world"}'));
+    });
+
+    test('PUT + 307 preserves method and body', () async {
+      final client = http_io.IOClient();
+      final request = http.Request('PUT', serverUrl.resolve('/redirect307'))
+        ..headers[HttpHeaders.contentTypeHeader] = 'application/json'
+        ..body = '{"updated":true}';
+
+      final response = await client.send(request);
+      final decoded = jsonDecode(await response.stream.bytesToString())
+          as Map<String, dynamic>;
+      client.close();
+
+      expect(decoded['method'], equals('PUT'));
+      expect(decoded['path'], equals('/'));
+      expect(decoded['body'], equals('{"updated":true}'));
+    });
+
+    test('exceeding maxRedirects on 307 loop throws ClientException', () async {
+      final client = http_io.IOClient();
+      final request =
+          http.Request('POST', serverUrl.resolve('/loop307?n=0'))
+            ..maxRedirects = 2
+            ..body = 'data';
+
+      await expectLater(
+        client.send(request),
+        throwsA(isA<http.ClientException>()),
+      );
+      client.close();
+    });
+
+    test('GET + 307 still delegates redirect to dart:io (no manual loop)',
+        () async {
+      final client = http_io.IOClient();
+      // A GET request should follow the 307 without manual intervention and
+      // land on '/' with an empty body (GET has no body to replay).
+      final request = http.Request('GET', serverUrl.resolve('/redirect307'));
+
+      final response = await client.send(request);
+      final decoded = jsonDecode(await response.stream.bytesToString())
+          as Map<String, dynamic>;
+      client.close();
+
+      expect(decoded['method'], equals('GET'));
+      expect(decoded['path'], equals('/'));
+    });
+
+    test(
+        'StreamedRequest + 307 is not followed manually (body not replayable)',
+        () async {
+      final client = http_io.IOClient();
+      final request =
+          http.StreamedRequest('POST', serverUrl.resolve('/redirect307'))
+            ..headers[HttpHeaders.contentTypeHeader] = 'application/json'
+            // Disable auto-follow so the raw 307 is returned to the caller.
+            ..followRedirects = false;
+
+      final responseFuture = client.send(request);
+      request.sink.add('{"hello":"world"}'.codeUnits);
+      unawaited(request.sink.close());
+
+      final response = await responseFuture;
+      client.close();
+
+      // The 307 should be returned as-is — no manual replay occurred.
+      expect(response.statusCode, equals(307));
+    });
+  });
 }

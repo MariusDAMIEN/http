@@ -44,6 +44,35 @@ void hybridMain(StreamChannel<dynamic> channel) async {
       return;
     }
 
+    if (path == '/redirect307') {
+      response
+        ..statusCode = 307
+        ..headers.set('location', url.resolve('/').toString())
+        ..contentLength = 0;
+      unawaited(response.close());
+      return;
+    }
+
+    if (path == '/redirect308') {
+      response
+        ..statusCode = 308
+        ..headers.set('location', url.resolve('/').toString())
+        ..contentLength = 0;
+      unawaited(response.close());
+      return;
+    }
+
+    if (path == '/loop307') {
+      var n = int.parse(request.uri.queryParameters['n'] ?? '0');
+      response
+        ..statusCode = 307
+        ..headers.set(
+            'location', url.resolve('/loop307?n=${n + 1}').toString())
+        ..contentLength = 0;
+      unawaited(response.close());
+      return;
+    }
+
     if (path == '/no-content-length') {
       response
         ..statusCode = 200

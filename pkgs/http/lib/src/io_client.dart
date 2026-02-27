@@ -108,121 +108,192 @@ class IOClient extends BaseClient {
           'HTTP request failed. Client is already closed.', request.url);
     }
 
+    // For non-GET/HEAD requests whose body can be replayed (http.Request),
+    // we handle 307/308 redirects manually because dart:io's HttpClient does
+    // not preserve the request method on 307/308 (RFC 9110 §15.4.8/15.4.9).
+    final handleRedirectsManually = request.followRedirects &&
+        request.method != 'GET' &&
+        request.method != 'HEAD' &&
+        request is Request;
+
+    // Snapshot body bytes before finalize() so they can be replayed on each
+    // redirect hop. For other request types the snapshot is unused.
+    final bodySnapshot =
+        handleRedirectsManually ? (request as Request).bodyBytes : null;
+
     var stream = request.finalize();
 
     try {
-      var ioRequest = (await _inner!.openUrl(request.method, request.url))
-        ..followRedirects = request.followRedirects
-        ..maxRedirects = request.maxRedirects
-        ..contentLength = (request.contentLength ?? -1)
-        ..persistentConnection = request.persistentConnection;
-      request.headers.forEach((name, value) {
-        ioRequest.headers.set(name, value);
-      });
+      var currentUrl = request.url;
+      var currentHeaders = Map<String, String>.from(request.headers);
+      var redirectCount = 0;
 
-      // SDK request aborting is only effective up until the request is closed,
-      // at which point the full response always becomes available.
-      // This occurs at `pipe`, which automatically closes the request once the
-      // request stream has been pumped in.
-      //
-      // Therefore, we have multiple strategies:
-      //  * If the user aborts before we have a response, we can use SDK abort,
-      //    which causes the `pipe` (and therefore this method) to throw the
-      //    aborted error
-      //  * If the user aborts after we have a response but before they listen
-      //    to it, we immediately emit the aborted error then close the response
-      //    as soon as they listen to it
-      //  * If the user aborts whilst streaming the response, we inject the
-      //    aborted error, then close the response
-
+      // Shared abort state. The flag and the mutable pointer to the active
+      // dart:io request are updated by each loop iteration so that the abort
+      // callback can cancel whichever hop is currently in flight.
       var isAborted = false;
       var hasResponse = false;
+      HttpClientRequest? activeIoRequest;
 
-      if (request case Abortable(:final abortTrigger?)) {
-        unawaited(
-          abortTrigger.whenComplete(() {
-            isAborted = true;
-            if (!hasResponse) {
-              ioRequest.abort(RequestAbortedException(request.url));
+      while (true) {
+        // Bail out early if abort fired between hops (e.g. while draining a
+        // redirect response body).
+        if (isAborted) throw RequestAbortedException(request.url);
+        hasResponse = false;
+
+        var ioRequest =
+            (await _inner!.openUrl(request.method, currentUrl))
+              // When handling redirects manually we disable dart:io auto-follow
+              // so that we stay in control of every hop.
+              ..followRedirects =
+                  !handleRedirectsManually && request.followRedirects
+              ..maxRedirects =
+                  handleRedirectsManually ? 0 : request.maxRedirects
+              ..contentLength = (request.contentLength ?? -1)
+              ..persistentConnection = request.persistentConnection;
+
+        activeIoRequest = ioRequest;
+        currentHeaders.forEach((name, value) {
+          ioRequest.headers.set(name, value);
+        });
+
+        // SDK request aborting is only effective up until the request is
+        // closed, at which point the full response always becomes available.
+        // This occurs at `pipe`, which automatically closes the request once
+        // the request stream has been pumped in.
+        //
+        // Therefore, we have multiple strategies:
+        //  * If the user aborts before we have a response, we can use SDK
+        //    abort, which causes the `pipe` (and therefore this method) to
+        //    throw the aborted error
+        //  * If the user aborts after we have a response but before they
+        //    listen to it, we immediately emit the aborted error then close
+        //    the response as soon as they listen to it
+        //  * If the user aborts whilst streaming the response, we inject the
+        //    aborted error, then close the response
+        //
+        // The abort trigger is set up AFTER creating ioRequest so that if
+        // abort fires before openUrl returns, the whenComplete callback fires
+        // immediately (the future is already complete) and aborts the
+        // ioRequest before pipe is called. For redirect hops we only reach
+        // this point when isAborted == false, so the trigger hasn't fired yet
+        // and registering another whenComplete listener is safe.
+        if (request case Abortable(:final abortTrigger?)) {
+          unawaited(
+            abortTrigger.whenComplete(() {
+              isAborted = true;
+              if (!hasResponse) {
+                activeIoRequest?.abort(RequestAbortedException(request.url));
+              }
+            }),
+          );
+        }
+
+        // On the first hop use the finalized stream; on subsequent hops replay
+        // the snapshotted body bytes directly.
+        final bodyStream = bodySnapshot != null
+            ? ByteStream.fromBytes(bodySnapshot)
+            : stream;
+
+        final response =
+            await bodyStream.pipe(ioRequest) as HttpClientResponse;
+        hasResponse = true;
+
+        // ── Manual 307/308 redirect handling ─────────────────────────────
+        if (handleRedirectsManually &&
+            (response.statusCode == 307 || response.statusCode == 308)) {
+          final location = response.headers.value('location');
+          if (location != null) {
+            if (redirectCount >= request.maxRedirects) {
+              await response.drain<void>();
+              throw ClientException('Redirect limit exceeded', currentUrl);
             }
-          }),
+            final nextUrl = currentUrl.resolve(location);
+            // Drop sensitive headers when crossing origins (RFC 9110 §15.4).
+            if (nextUrl.origin != currentUrl.origin) {
+              currentHeaders = Map.of(currentHeaders)
+                ..remove('authorization');
+            }
+            currentUrl = nextUrl;
+            redirectCount++;
+            await response.drain<void>();
+            continue;
+          }
+        }
+        // ─────────────────────────────────────────────────────────────────
+
+        StreamSubscription<List<int>>? ioResponseSubscription;
+
+        late final StreamController<List<int>> responseController;
+        responseController = StreamController(
+          onListen: () {
+            if (isAborted) {
+              responseController
+                ..addError(RequestAbortedException(request.url))
+                ..close();
+              return;
+            } else if (request case Abortable(:final abortTrigger?)) {
+              abortTrigger.whenComplete(() {
+                if (!responseController.isClosed) {
+                  responseController
+                    ..addError(RequestAbortedException(request.url))
+                    ..close();
+                }
+                ioResponseSubscription?.cancel();
+              });
+            }
+
+            ioResponseSubscription = response.listen(
+              responseController.add,
+              onDone: () {
+                // `reponseController.close` will trigger the `onCancel`
+                // callback. Assign `ioResponseSubscription` to `null` to
+                // avoid calling its `cancel` method.
+                ioResponseSubscription = null;
+                unawaited(responseController.close());
+              },
+              onError: (Object err, StackTrace stackTrace) {
+                if (err is HttpException) {
+                  responseController.addError(
+                    ClientException(err.message, err.uri),
+                    stackTrace,
+                  );
+                } else {
+                  responseController.addError(err, stackTrace);
+                }
+              },
+            );
+          },
+          onPause: () => ioResponseSubscription?.pause(),
+          onResume: () => ioResponseSubscription?.resume(),
+          onCancel: () => ioResponseSubscription?.cancel(),
+          sync: true,
+        );
+
+        var headers = <String, String>{};
+        response.headers.forEach((key, values) {
+          // TODO: Remove trimRight() when
+          // https://github.com/dart-lang/sdk/issues/53005 is resolved and
+          // the package:http SDK constraint requires that version or later.
+          headers[key] = values.map((value) => value.trimRight()).join(',');
+        });
+
+        return _IOStreamedResponseV2(
+          responseController.stream,
+          response.statusCode,
+          contentLength:
+              response.contentLength == -1 ? null : response.contentLength,
+          request: request,
+          headers: headers,
+          isRedirect: response.isRedirect,
+          url: response.redirects.isNotEmpty
+              ? response.redirects.last.location
+              : currentUrl,
+          persistentConnection: response.persistentConnection,
+          reasonPhrase: response.reasonPhrase,
+          inner: response,
         );
       }
-
-      final response = await stream.pipe(ioRequest) as HttpClientResponse;
-      hasResponse = true;
-
-      StreamSubscription<List<int>>? ioResponseSubscription;
-
-      late final StreamController<List<int>> responseController;
-      responseController = StreamController(
-        onListen: () {
-          if (isAborted) {
-            responseController
-              ..addError(RequestAbortedException(request.url))
-              ..close();
-            return;
-          } else if (request case Abortable(:final abortTrigger?)) {
-            abortTrigger.whenComplete(() {
-              if (!responseController.isClosed) {
-                responseController
-                  ..addError(RequestAbortedException(request.url))
-                  ..close();
-              }
-              ioResponseSubscription?.cancel();
-            });
-          }
-
-          ioResponseSubscription = response.listen(
-            responseController.add,
-            onDone: () {
-              // `reponseController.close` will trigger the `onCancel` callback.
-              // Assign `ioResponseSubscription` to `null` to avoid calling its
-              // `cancel` method.
-              ioResponseSubscription = null;
-              unawaited(responseController.close());
-            },
-            onError: (Object err, StackTrace stackTrace) {
-              if (err is HttpException) {
-                responseController.addError(
-                  ClientException(err.message, err.uri),
-                  stackTrace,
-                );
-              } else {
-                responseController.addError(err, stackTrace);
-              }
-            },
-          );
-        },
-        onPause: () => ioResponseSubscription?.pause(),
-        onResume: () => ioResponseSubscription?.resume(),
-        onCancel: () => ioResponseSubscription?.cancel(),
-        sync: true,
-      );
-
-      var headers = <String, String>{};
-      response.headers.forEach((key, values) {
-        // TODO: Remove trimRight() when
-        // https://github.com/dart-lang/sdk/issues/53005 is resolved and the
-        // package:http SDK constraint requires that version or later.
-        headers[key] = values.map((value) => value.trimRight()).join(',');
-      });
-
-      return _IOStreamedResponseV2(
-        responseController.stream,
-        response.statusCode,
-        contentLength:
-            response.contentLength == -1 ? null : response.contentLength,
-        request: request,
-        headers: headers,
-        isRedirect: response.isRedirect,
-        url: response.redirects.isNotEmpty
-            ? response.redirects.last.location
-            : request.url,
-        persistentConnection: response.persistentConnection,
-        reasonPhrase: response.reasonPhrase,
-        inner: response,
-      );
     } on SocketException catch (error) {
       throw _ClientSocketException(error, request.url);
     } on HttpException catch (error) {

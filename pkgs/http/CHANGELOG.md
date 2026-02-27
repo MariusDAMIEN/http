@@ -1,6 +1,11 @@
 ## 1.6.1-wip
 
 * Clarified the behavior of response headers in API documentation comments.
+* `IOClient` now follows 307/308 redirects for non-GET/HEAD requests when
+  the request body is replayable (`Request`), preserving the original method
+  and body per RFC 9110. The `Authorization` header is dropped automatically
+  on cross-origin redirects. `StreamedRequest` and `MultipartRequest` are
+  unaffected.
 
 ## 1.6.0
 
